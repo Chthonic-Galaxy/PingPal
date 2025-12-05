@@ -1,0 +1,34 @@
+services:
+  nats:
+    image: nats:latest
+    command: "-js -m 8222 -sd /data"
+    ports:
+      - "4222:4222" # For clients
+      - "8222:8222" # For monitoring
+    volumes:
+      - nats_data:/data
+
+  # Database: Postgres + TimescaleDB
+  db:
+    container_name: pingpal_database
+    image: timescale/timescaledb:2.23.1-pg17
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_DB=pingpal
+      - POSTGRES_USER=pingpal
+      - POSTGRES_PASSWORD_FILE=/run/secrets/pg_password
+    secrets:
+      - pg_password
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+
+
+volumes:
+  pg_data:
+    # external: true # For production, prevents from removing the volume
+  nats_data:
+    # external: true # For production, prevents from removing the volume
+secrets:
+  pg_password:
+    file: ./secrets/pg_password.txt
