@@ -8,7 +8,6 @@ services:
     volumes:
       - nats_data:/data
 
-  # Database: Postgres + TimescaleDB
   db:
     container_name: pingpal_database
     image: timescale/timescaledb:2.23.1-pg17
@@ -22,7 +21,59 @@ services:
       - pg_password
     volumes:
       - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U pingpal -d pingpal"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
 
+  migration:
+    build: .
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      - PINGPAL_DB_HOST=db
+      - PINGPAL_DB_PORT=5432
+      - PINGPAL_DB_USER=pingpal
+      - PINGPAL_DB_NAME=pingpal
+    secrets:
+      - pg_password
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  core:
+    build: .
+    command:
+      ["uvicorn", "src.core.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8000:8000"
+    environment:
+      - NATS_URL=nats://nats:4222
+      - PINGPAL_DB_HOST=db
+      - PINGPAL_DB_PORT=5432
+      - PINGPAL_DB_USER=pingpal
+      - PINGPAL_DB_NAME=pingpal
+    secrets:
+      - pg_password
+    depends_on:
+      migration:
+        condition: service_completed_successfully
+      nats:
+        condition: service_started
+    restart: unless-stopped
+
+  agent:
+    build: .
+    command: ["python", "-m", "src.agent.main"]
+    environment:
+      - NATS_URL=nats://nats:4222
+    depends_on:
+      migration:
+        condition: service_completed_successfully
+      nats:
+        condition: service_started
+    restart: unless-stopped
 
 volumes:
   pg_data:

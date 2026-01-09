@@ -12,21 +12,28 @@ from typing import Any
 from uuid import UUID
 
 import httpx
+import nats.errors
+import nats.js.errors as js_errors
 from nats.aio.client import Client as NATS
+from nats.js.api import KeyValueConfig, StorageType
 from pydantic import AnyHttpUrl, BaseModel, Field
 
 logger = logging.getLogger("pingpal-agent")
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 
-NATS_CONFIG_SUBJECT = "pingpal.config.updates"
+KV_BUCKET = "pingpal_config"
+KV_WATCH_PATTERN = "site.*"
 NATS_METRICS_SUBJECT = "pingpal.metrics.ingest"
 
+KV_DEL = "DEL"
+KV_PURGE = "PURGE"
 
-class ConfigUpdate(BaseModel):
-    type: str = Field(..., pattern="^(ADD|REMOVE)$")
+
+class SiteConfig(BaseModel):
     site_id: UUID
-    url: AnyHttpUrl | None = None
-    interval: int | None = Field(default=None, ge=5, le=24 * 60 * 60)
+    url: AnyHttpUrl
+    interval: int = Field(ge=5, le=24 * 60 * 60)
+    is_active: bool = True
 
 
 @dataclass
@@ -50,7 +57,6 @@ async def ping_loop(
     client: httpx.AsyncClient,
     stop: asyncio.Event,
 ) -> None:
-    # Small guardrail
     interval = max(1, int(interval))
 
     try:
@@ -80,13 +86,11 @@ async def ping_loop(
 
             try:
                 await nc.publish(
-                    NATS_METRICS_SUBJECT,
-                    json.dumps(payload).encode("utf-8"),
+                    NATS_METRICS_SUBJECT, json.dumps(payload).encode("utf-8")
                 )
             except Exception:
                 logger.exception("Failed to publish metric for site_id=%s", site_id)
 
-            # Sleep until next interval or stop
             try:
                 await asyncio.wait_for(stop.wait(), timeout=interval)
             except asyncio.TimeoutError:
@@ -97,20 +101,46 @@ async def ping_loop(
         logger.exception("ping_loop crashed for site_id=%s", site_id)
 
 
+async def ensure_kv_bucket(nc: NATS):
+    js = nc.jetstream()
+
+    try:
+        return await js.key_value(KV_BUCKET)
+    except js_errors.NotFoundError:
+        pass
+
+    try:
+        await js.create_key_value(
+            KeyValueConfig(
+                bucket=KV_BUCKET,
+                description="PingPal site configuration (source of truth for Agents)",
+                storage=StorageType.FILE,
+                history=1,
+            )
+        )
+    except js_errors.APIError as e:
+        if getattr(e, "err_code", None) != 10058:
+            raise
+
+    return await js.key_value(KV_BUCKET)
+
+
 async def main() -> None:
-    nats_url = os.getenv("NATS_URL", "nats://localhost:4222")
+    nats_url = os.getenv("NATS_URL", "nats://127.0.0.1:4222")
 
     nc = NATS()
-    await nc.connect(servers=[nats_url], name="pingpal-agent")
+    await nc.connect(
+        servers=[nats_url],
+        name="pingpal-agent",
+        reconnect_time_wait=2,
+        max_reconnect_attempts=-1,
+    )
+
+    kv = await ensure_kv_bucket(nc)
 
     tasks: dict[UUID, RunningTask] = {}
 
-    timeout = httpx.Timeout(
-        connect=5.0,
-        read=10.0,
-        write=10.0,
-        pool=5.0,
-    )
+    timeout = httpx.Timeout(connect=5.0, read=10.0, write=10.0, pool=5.0)
     async with httpx.AsyncClient(timeout=timeout) as client:
 
         async def stop_task(site_id: UUID) -> None:
@@ -122,74 +152,107 @@ async def main() -> None:
             await asyncio.gather(rt.task, return_exceptions=True)
             logger.info("Stopped task site_id=%s", site_id)
 
-        async def start_or_restart_task(site_id: UUID, url: str, interval: int) -> None:
-            existing = tasks.get(site_id)
-            if existing and existing.url == url and existing.interval == interval:
+        async def start_or_restart_task(cfg: SiteConfig) -> None:
+            if not cfg.is_active:
+                await stop_task(cfg.site_id)
+                return
+
+            existing = tasks.get(cfg.site_id)
+            if (
+                existing
+                and existing.url == str(cfg.url)
+                and existing.interval == int(cfg.interval)
+            ):
                 return
 
             if existing:
-                await stop_task(site_id)
+                await stop_task(cfg.site_id)
 
             stop_evt = asyncio.Event()
             t = asyncio.create_task(
                 ping_loop(
-                    site_id=site_id,
-                    url=url,
-                    interval=interval,
+                    site_id=cfg.site_id,
+                    url=str(cfg.url),
+                    interval=int(cfg.interval),
                     nc=nc,
                     client=client,
                     stop=stop_evt,
                 )
             )
-            tasks[site_id] = RunningTask(
-                stop=stop_evt, task=t, url=url, interval=interval
+            tasks[cfg.site_id] = RunningTask(
+                stop=stop_evt,
+                task=t,
+                url=str(cfg.url),
+                interval=int(cfg.interval),
             )
             logger.info(
-                "Started task site_id=%s interval=%s url=%s", site_id, interval, url
+                "Started task site_id=%s interval=%s url=%s",
+                cfg.site_id,
+                cfg.interval,
+                cfg.url,
             )
 
-        async def on_config_msg(msg):
-            try:
-                raw = json.loads(msg.data.decode("utf-8"))
-                update = ConfigUpdate(**raw)
-
-                if update.type == "REMOVE":
-                    await stop_task(update.site_id)
-                    return
-
-                # ADD
-                if update.url is None or update.interval is None:
-                    logger.warning("Invalid ADD payload missing url/interval: %s", raw)
-                    return
-
-                await start_or_restart_task(
-                    update.site_id, str(update.url), int(update.interval)
-                )
-
-            except Exception:
-                logger.exception("Failed to handle config message: %r", msg.data)
-
-        sub = await nc.subscribe(NATS_CONFIG_SUBJECT, cb=on_config_msg)
-
-        # Graceful shutdown
         shutdown_evt = asyncio.Event()
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
             try:
                 loop.add_signal_handler(sig, shutdown_evt.set)
             except NotImplementedError:
-                # Some platforms (e.g. Windows) may not support it
                 pass
+
+        async def kv_watch_loop() -> None:
+            """
+            ВАЖНО: KeyWatcher кладёт `None` как маркер "initial catch-up finished".
+            Но `async for entry in watcher` завершится на первом None (см. __anext__),
+            поэтому используем бесконечный while + watcher.updates().
+            """
+            watcher = await kv.watch(KV_WATCH_PATTERN, include_history=True)
+
+            try:
+                while not shutdown_evt.is_set():
+                    try:
+                        entry = await watcher.updates(timeout=1.0)
+                    except nats.errors.TimeoutError:
+                        continue
+
+                    if entry is None:
+                        continue
+
+                    op = entry.operation
+                    key = entry.key
+
+                    if op in (KV_DEL, KV_PURGE):
+                        if key.startswith("site."):
+                            raw_id = key.split("site.", 1)[1]
+                            try:
+                                await stop_task(UUID(raw_id))
+                            except Exception:
+                                logger.warning("DEL/PURGE for unparseable key=%s", key)
+                        continue
+
+                    if not entry.value:
+                        continue
+
+                    try:
+                        raw = json.loads(entry.value.decode("utf-8"))
+                        cfg = SiteConfig(**raw)
+                        await start_or_restart_task(cfg)
+                    except Exception:
+                        logger.exception("Failed to handle KV PUT key=%s", key)
+
+            finally:
+                try:
+                    await watcher.stop()
+                except Exception:
+                    pass
+
+        watch_task = asyncio.create_task(kv_watch_loop())
 
         await shutdown_evt.wait()
 
-        # Cleanup
-        try:
-            await sub.unsubscribe()
-        except Exception:
-            pass
+        watch_task.cancel()
+        await asyncio.gather(watch_task, return_exceptions=True)
 
-        # Stop all ping loops
         await asyncio.gather(
             *(stop_task(site_id) for site_id in list(tasks.keys())),
             return_exceptions=True,

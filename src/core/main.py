@@ -7,10 +7,12 @@ import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
+import nats.js.errors as js_errors
 from fastapi import Depends, FastAPI, HTTPException, Path, Request
 from nats.aio.client import Client as NATS
+from nats.js.api import KeyValueConfig, StorageType
 from pydantic import AnyHttpUrl, BaseModel, Field
 from sqlalchemy import func, insert, select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
@@ -21,14 +23,14 @@ from src.database import (
     build_db_settings,
     create_engine,
     create_sessionmaker,
-    init_db,
+    wait_for_db,
 )
 
 logger = logging.getLogger("pingpal-core")
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 
-
-NATS_CONFIG_SUBJECT = "pingpal.config.updates"
+KV_BUCKET = "pingpal_config"
+KV_KEY_PREFIX = "site."
 NATS_METRICS_SUBJECT = "pingpal.metrics.ingest"
 
 
@@ -64,10 +66,10 @@ def _parse_dt(value: Any) -> datetime:
     if isinstance(value, datetime):
         dt = value
     elif isinstance(value, str):
-        # Accept ISO-8601 from agent
         dt = datetime.fromisoformat(value)
     else:
         raise ValueError("invalid timestamp")
+
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
@@ -79,32 +81,91 @@ async def get_session(request: Request) -> AsyncSession:
         yield session
 
 
-async def _publish_active_sites(app: FastAPI) -> None:
-    """
-    MVP convenience: on Core startup, re-emit ADD events so an Agent
-    starting later can still learn current config.
-    """
-    nc: NATS = app.state.nats
-    sessionmaker: async_sessionmaker[AsyncSession] = app.state.sessionmaker
+def _site_key(site_id: UUID) -> str:
+    return f"{KV_KEY_PREFIX}{site_id}"
 
-    async with sessionmaker() as session:
-        rows = (
-            (await session.execute(select(Site).where(Site.is_active.is_(True))))
-            .scalars()
-            .all()
+
+def _site_value(site: Site) -> bytes:
+    payload = {
+        "site_id": str(site.id),
+        "url": site.url,
+        "interval": site.interval,
+        "is_active": site.is_active,
+    }
+    return json.dumps(payload).encode("utf-8")
+
+
+async def _ensure_kv_bucket(nc: NATS):
+    """
+    Create (if needed) and return KV bucket.
+    No BucketAlreadyExistsError in nats-py: use NotFoundError + APIError(err_code).
+    """
+    js = nc.jetstream()
+
+    try:
+        return await js.key_value(KV_BUCKET)
+    except js_errors.NotFoundError:
+        pass
+
+    try:
+        await js.create_key_value(
+            KeyValueConfig(
+                bucket=KV_BUCKET,
+                description="PingPal site configuration (source of truth for Agents)",
+                storage=StorageType.FILE,
+                history=1,
+            )
         )
+    except js_errors.APIError as e:
+        if getattr(e, "err_code", None) != 10058:
+            raise
 
-    for s in rows:
-        payload = {
-            "type": "ADD",
-            "site_id": str(s.id),
-            "url": s.url,
-            "interval": s.interval,
-        }
+    return await js.key_value(KV_BUCKET)
+
+
+async def _sync_kv_from_db(
+    sessionmaker: async_sessionmaker[AsyncSession],
+    kv,
+) -> None:
+    async with sessionmaker() as session:
+        sites = (await session.execute(select(Site))).scalars().all()
+
+    db_ids = {s.id for s in sites}
+    active_ids = {s.id for s in sites if s.is_active}
+
+    for s in sites:
+        key = _site_key(s.id)
         try:
-            await nc.publish(NATS_CONFIG_SUBJECT, json.dumps(payload).encode("utf-8"))
+            if s.is_active:
+                await kv.put(key, _site_value(s))
+            else:
+                try:
+                    await kv.delete(key)
+                except Exception:
+                    pass
         except Exception:
-            logger.exception("Failed to publish startup ADD for site_id=%s", s.id)
+            logger.exception("KV sync failed for site_id=%s", s.id)
+
+    try:
+        keys = await kv.keys()
+    except Exception:
+        keys = None
+
+    if keys:
+        for key in keys:
+            if not key.startswith(KV_KEY_PREFIX):
+                continue
+            raw_id = key[len(KV_KEY_PREFIX) :]
+            try:
+                site_id = UUID(raw_id)
+            except Exception:
+                continue
+
+            if site_id not in db_ids or site_id not in active_ids:
+                try:
+                    await kv.delete(key)
+                except Exception:
+                    pass
 
 
 async def _metrics_db_worker(
@@ -148,19 +209,28 @@ async def lifespan(app: FastAPI):
     db_settings = build_db_settings()
     engine: AsyncEngine = create_engine(db_settings)
     sessionmaker = create_sessionmaker(engine)
-
     app.state.engine = engine
     app.state.sessionmaker = sessionmaker
 
-    await init_db(engine)
+    await wait_for_db(engine)
 
-    # NATS
-    nats_url = os.getenv("NATS_URL", "nats://localhost:4222")
+    # NATS + KV
+    nats_url = os.getenv("NATS_URL", "nats://127.0.0.1:4222")
     nc = NATS()
-    await nc.connect(servers=[nats_url], name="pingpal-core")
+    await nc.connect(
+        servers=[nats_url],
+        name="pingpal-core",
+        reconnect_time_wait=2,
+        max_reconnect_attempts=-1,
+    )
     app.state.nats = nc
 
-    # Metrics ingestion pipeline
+    kv = await _ensure_kv_bucket(nc)
+    app.state.kv = kv
+
+    await _sync_kv_from_db(sessionmaker, kv)
+
+    # Metrics ingestion
     metrics_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=50_000)
     app.state.metrics_queue = metrics_queue
 
@@ -183,21 +253,16 @@ async def lifespan(app: FastAPI):
             }
             metrics_queue.put_nowait(row)
         except asyncio.QueueFull:
-            logger.warning("metrics_queue is full; dropping metric message")
+            logger.warning("metrics_queue is full; dropping metric")
         except Exception:
             logger.exception("Failed to parse/queue metric message")
 
     sub = await nc.subscribe(NATS_METRICS_SUBJECT, cb=on_metric_msg)
-
     worker_task = asyncio.create_task(_metrics_db_worker(sessionmaker, metrics_queue))
-
-    # Emit current active sites as ADD events (MVP quality-of-life)
-    await _publish_active_sites(app)
 
     try:
         yield
     finally:
-        # Shutdown
         worker_task.cancel()
         await asyncio.gather(worker_task, return_exceptions=True)
 
@@ -224,30 +289,25 @@ app = FastAPI(title="PingPal Core", lifespan=lifespan)
 async def create_site(
     payload: SiteCreate, session: AsyncSession = Depends(get_session)
 ):
-    site = Site(url=str(payload.url), interval=payload.interval, is_active=True)
+    site = Site(
+        id=uuid4(), url=str(payload.url), interval=payload.interval, is_active=True
+    )
     session.add(site)
     await session.commit()
     await session.refresh(site)
 
-    # Publish config update (best-effort)
-    nc: NATS = app.state.nats
-    msg = {
-        "type": "ADD",
-        "site_id": str(site.id),
-        "url": site.url,
-        "interval": site.interval,
-    }
+    kv = app.state.kv
     try:
-        await nc.publish(NATS_CONFIG_SUBJECT, json.dumps(msg).encode("utf-8"))
+        await kv.put(_site_key(site.id), _site_value(site))
     except Exception:
-        logger.exception("Failed to publish ADD config update for site_id=%s", site.id)
+        logger.exception("Failed to KV.PUT config for site_id=%s", site.id)
 
     return SiteOut(
         id=site.id,
         url=site.url,
         interval=site.interval,
         is_active=site.is_active,
-        created_at=site.created_at,
+        created_at=site.created_at,  # type: ignore[arg-type]
     )
 
 
@@ -264,10 +324,33 @@ async def list_sites(session: AsyncSession = Depends(get_session)):
             url=s.url,
             interval=s.interval,
             is_active=s.is_active,
-            created_at=s.created_at,
+            created_at=s.created_at,  # type: ignore[arg-type]
         )
         for s in sites
     ]
+
+
+@app.delete("/sites/{site_id}", status_code=204)
+async def deactivate_site(
+    site_id: UUID = Path(...),
+    session: AsyncSession = Depends(get_session),
+):
+    site = (
+        await session.execute(select(Site).where(Site.id == site_id))
+    ).scalar_one_or_none()
+    if site is None:
+        raise HTTPException(status_code=404, detail="site not found")
+
+    site.is_active = False
+    await session.commit()
+
+    kv = app.state.kv
+    try:
+        await kv.delete(_site_key(site_id))
+    except Exception:
+        logger.exception("Failed to KV.DEL site_id=%s", site_id)
+
+    return None
 
 
 @app.get("/sites/{site_id}/stats", response_model=SiteStatsOut)
