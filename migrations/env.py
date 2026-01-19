@@ -76,7 +76,7 @@ async def run_migrations_online() -> None:
 
     for attempt in range(1, retries + 1):
         try:
-            async with connectable.connect() as connection:
+            async with connectable.begin() as connection:
                 await connection.execute(text("SELECT 1;"))
                 await connection.run_sync(do_run_migrations)
 
@@ -88,7 +88,7 @@ async def run_migrations_online() -> None:
             await asyncio.sleep(delay)
 
     if last_exc is not None:
-        async with connectable.connect() as connection:
+        async with connectable.begin() as connection:
             await connection.execute(text("SELECT 1;"))
             await connection.run_sync(do_run_migrations)
 

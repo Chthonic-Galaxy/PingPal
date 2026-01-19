@@ -74,6 +74,32 @@ services:
       nats:
         condition: service_started
     restart: unless-stopped
+    
+  agent-us:
+    build: .
+    command: ["python", "-m", "src.agent.main"]
+    environment:
+      - NATS_URL=nats://nats:4222
+      - PINGPAL_REGION=us-east
+    depends_on:
+      migration:
+        condition: service_completed_successfully
+      nats:
+        condition: service_started
+    restart: unless-stopped
+    
+  agent-eu:
+    build: .
+    command: ["python", "-m", "src.agent.main"]
+    environment:
+      - NATS_URL=nats://nats:4222
+      - PINGPAL_REGION=eu-central
+    depends_on:
+      migration:
+        condition: service_completed_successfully
+      nats:
+        condition: service_started
+    restart: unless-stopped
 
 volumes:
   pg_data:

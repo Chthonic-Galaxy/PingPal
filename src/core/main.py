@@ -56,6 +56,7 @@ class SiteStatsOut(BaseModel):
 
 class MetricIngest(BaseModel):
     site_id: UUID
+    region: str
     status_code: int
     latency_ms: float
     timestamp: datetime
@@ -239,6 +240,7 @@ async def lifespan(app: FastAPI):
             data = json.loads(msg.data.decode("utf-8"))
             ingest = MetricIngest(
                 site_id=UUID(str(data["site_id"])),
+                region=data["region"],
                 status_code=int(data["status_code"]),
                 latency_ms=float(data["latency_ms"]),
                 timestamp=_parse_dt(data["timestamp"]),
@@ -247,6 +249,7 @@ async def lifespan(app: FastAPI):
             row = {
                 "time": ingest.timestamp,
                 "site_id": ingest.site_id,
+                "region": ingest.region,
                 "status_code": ingest.status_code,
                 "latency_ms": ingest.latency_ms,
                 "error_message": ingest.error_message,

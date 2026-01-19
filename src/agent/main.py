@@ -28,6 +28,8 @@ NATS_METRICS_SUBJECT = "pingpal.metrics.ingest"
 KV_DEL = "DEL"
 KV_PURGE = "PURGE"
 
+AGENT_REGION = os.getenv("PINGPAL_REGION", "global")
+
 
 class SiteConfig(BaseModel):
     site_id: UUID
@@ -42,6 +44,7 @@ class RunningTask:
     task: asyncio.Task[None]
     url: str
     interval: int
+    is_sleeping: bool = False
 
 
 def utc_now_iso() -> str:
@@ -56,11 +59,14 @@ async def ping_loop(
     nc: NATS,
     client: httpx.AsyncClient,
     stop: asyncio.Event,
+    rt_state: RunningTask,
 ) -> None:
     interval = max(1, int(interval))
 
     try:
         while not stop.is_set():
+            rt_state.is_sleeping = False
+
             started = time.perf_counter()
             status_code = 0
             error_message: str | None = None
@@ -80,6 +86,7 @@ async def ping_loop(
                 "status_code": status_code,
                 "latency_ms": latency_ms,
                 "timestamp": utc_now_iso(),
+                "region": AGENT_REGION,
             }
             if error_message:
                 payload["error_message"] = error_message
@@ -91,6 +98,7 @@ async def ping_loop(
             except Exception:
                 logger.exception("Failed to publish metric for site_id=%s", site_id)
 
+            rt_state.is_sleeping = True
             try:
                 await asyncio.wait_for(stop.wait(), timeout=interval)
             except asyncio.TimeoutError:
@@ -148,7 +156,11 @@ async def main() -> None:
             if not rt:
                 return
             rt.stop.set()
-            rt.task.cancel()
+            if rt.is_sleeping:
+                rt.task.cancel()
+                logger.info("Cancelling sleeping task site_id=%s", site_id)
+            else:
+                logger.info("Waiting for busy task to finish site_id=%s", site_id)
             await asyncio.gather(rt.task, return_exceptions=True)
             logger.info("Stopped task site_id=%s", site_id)
 
@@ -169,6 +181,15 @@ async def main() -> None:
                 await stop_task(cfg.site_id)
 
             stop_evt = asyncio.Event()
+            # task config pre-creating
+            rt = RunningTask(
+                stop=stop_evt,
+                task=None,  # pyright: ignore[reportArgumentType]
+                url=str(cfg.url),
+                interval=int(cfg.interval),
+                is_sleeping=False,
+            )
+
             t = asyncio.create_task(
                 ping_loop(
                     site_id=cfg.site_id,
@@ -177,14 +198,13 @@ async def main() -> None:
                     nc=nc,
                     client=client,
                     stop=stop_evt,
+                    rt_state=rt,  # forward running task there
                 )
             )
-            tasks[cfg.site_id] = RunningTask(
-                stop=stop_evt,
-                task=t,
-                url=str(cfg.url),
-                interval=int(cfg.interval),
-            )
+
+            rt.task = t
+            tasks[cfg.site_id] = rt
+
             logger.info(
                 "Started task site_id=%s interval=%s url=%s",
                 cfg.site_id,

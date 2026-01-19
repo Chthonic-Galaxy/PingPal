@@ -59,6 +59,9 @@ class Metric(Base):
         ForeignKey("sites.id", ondelete="CASCADE"),
         primary_key=True,
     )
+    region: Mapped[str] = mapped_column(
+        String(50), nullable=False, server_default="global"
+    )
     status_code: Mapped[int] = mapped_column(Integer, nullable=False)
     latency_ms: Mapped[float] = mapped_column(Float, nullable=False)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
