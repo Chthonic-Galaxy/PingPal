@@ -5,12 +5,12 @@ import json
 import logging
 import os
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID, uuid4
 
 import nats.js.errors as js_errors
-from fastapi import Depends, FastAPI, HTTPException, Path, Request
+from fastapi import Depends, FastAPI, HTTPException, Path, Query, Request
 from nats.aio.client import Client as NATS
 from nats.js.api import KeyValueConfig, StorageType
 from pydantic import AnyHttpUrl, BaseModel, Field
@@ -34,6 +34,12 @@ KV_KEY_PREFIX = "site."
 NATS_METRICS_SUBJECT = "pingpal.metrics.ingest"
 
 
+class SiteHealth(BaseModel):
+    site_id: UUID
+    status: str  # "UP", "DOWN", "PARTIAL_OUTAGE", "UNKNOWN"
+    failing_regions: list[str]
+
+
 class SiteCreate(BaseModel):
     url: AnyHttpUrl
     interval: int = Field(default=60, ge=5, le=24 * 60 * 60)
@@ -49,6 +55,7 @@ class SiteOut(BaseModel):
 
 class SiteStatsOut(BaseModel):
     site_id: UUID
+    region: str | None
     avg_latency_ms: float | None
     last_status_code: int | None
     last_check_at: datetime | None
@@ -359,6 +366,7 @@ async def deactivate_site(
 @app.get("/sites/{site_id}/stats", response_model=SiteStatsOut)
 async def site_stats(
     site_id: UUID = Path(...),
+    region: str | None = Query(None),
     session: AsyncSession = Depends(get_session),
 ):
     exists = await session.execute(select(Site.id).where(Site.id == site_id))
@@ -369,20 +377,23 @@ async def site_stats(
         Metric.site_id == site_id,
         Metric.status_code > 0,
     )
+    if region:
+        avg_latency_stmt = avg_latency_stmt.where(Metric.region == region)
+
     avg_latency = (await session.execute(avg_latency_stmt)).scalar_one_or_none()
     avg_latency_f = float(avg_latency) if avg_latency is not None else None
 
-    last_stmt = (
-        select(Metric.status_code, Metric.time)
-        .where(Metric.site_id == site_id)
-        .order_by(Metric.time.desc())
-        .limit(1)
-    )
+    last_stmt = select(Metric.status_code, Metric.time).where(Metric.site_id == site_id)
+    if region:
+        last_stmt = last_stmt.where(Metric.region == region)
+    last_stmt = last_stmt.order_by(Metric.time.desc()).limit(1)
+
     last = (await session.execute(last_stmt)).first()
 
     if last is None:
         return SiteStatsOut(
             site_id=site_id,
+            region=region,
             avg_latency_ms=avg_latency_f,
             last_status_code=None,
             last_check_at=None,
@@ -391,7 +402,51 @@ async def site_stats(
     last_status_code, last_time = int(last[0]), last[1]
     return SiteStatsOut(
         site_id=site_id,
+        region=region,
         avg_latency_ms=avg_latency_f,
         last_status_code=last_status_code,
         last_check_at=last_time,
+    )
+
+
+@app.get("/sites/{site_id}/state", response_model=SiteHealth)
+async def check_health(
+    site_id: UUID = Path(...),
+    session: AsyncSession = Depends(get_session),
+):
+    exists = await session.execute(select(Site.id).where(Site.id == site_id))
+    if exists.scalar_one_or_none() is None:
+        raise HTTPException(status_code=404, detail="site not found")
+
+    stmt = (
+        select(Metric.region, Metric.status_code)
+        .distinct(Metric.region)
+        .where(
+            Metric.site_id == site_id,
+            Metric.time >= datetime.now(timezone.utc) - timedelta(minutes=5),
+        )
+        .order_by(Metric.region, Metric.time.desc())
+    )
+
+    result = await session.execute(stmt)
+    latest_metrics = result.all()
+
+    failing_regions = []
+    for region, status_code in latest_metrics:
+        if status_code >= 400 or status_code == 0:
+            failing_regions.append(region)
+
+    status = "UP"
+    unique_errors = len(failing_regions)
+
+    match unique_errors:
+        case 0:
+            status = "UP"
+        case 1:
+            status = "PARTIAL_OUTAGE"
+        case _:
+            status = "DOWN"
+
+    return SiteHealth(
+        site_id=site_id, status=status, failing_regions=list(failing_regions)
     )
