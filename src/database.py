@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-import os
 from dataclasses import dataclass
-from pathlib import Path
 from typing import AsyncIterator
 from uuid import UUID, uuid4
 
@@ -26,6 +24,8 @@ from sqlalchemy.ext.asyncio import (
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy.sql import func, text
+
+from src.config import settings
 
 
 class Base(DeclarativeBase):
@@ -75,44 +75,8 @@ class DBSettings:
     echo_sql: bool = False
 
 
-def _read_password_from_file(path: str) -> str | None:
-    try:
-        p = Path(path)
-        if not p.exists():
-            return None
-        value = p.read_text(encoding="utf-8").strip()
-        return value or None
-    except Exception:
-        return None
-
-
 def build_db_settings() -> DBSettings:
-    """
-    Priority:
-      1) DATABASE_URL
-      2) Build from components (+ password from env or secrets files)
-    """
-    direct = os.getenv("DATABASE_URL")
-    if direct:
-        return DBSettings(database_url=direct, echo_sql=os.getenv("SQL_ECHO") == "1")
-
-    user = os.getenv("PINGPAL_DB_USER", "pingpal")
-    db = os.getenv("PINGPAL_DB_NAME", "pingpal")
-
-    # In docker-compose network use "db"; on host use "127.0.0.1"
-    host = os.getenv("PINGPAL_DB_HOST", "127.0.0.1")
-    port = int(os.getenv("PINGPAL_DB_PORT", "5432"))
-
-    password = os.getenv("PINGPAL_DB_PASSWORD")
-    if not password:
-        password = _read_password_from_file("/run/secrets/pg_password")
-    if not password:
-        password = _read_password_from_file("./secrets/pg_password.txt")
-    if not password:
-        password = "pingpal"
-
-    url = f"postgresql+asyncpg://{user}:{password}@{host}:{port}/{db}"
-    return DBSettings(database_url=url, echo_sql=os.getenv("SQL_ECHO") == "1")
+    return DBSettings(database_url=settings.db_url, echo_sql=settings.db_echo)
 
 
 def create_engine(settings: DBSettings) -> AsyncEngine:

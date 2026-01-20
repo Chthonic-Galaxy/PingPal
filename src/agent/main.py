@@ -1,14 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-import os
 import signal
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
 from uuid import UUID
 
 import httpx
@@ -16,10 +13,12 @@ import nats.errors
 import nats.js.errors as js_errors
 from nats.aio.client import Client as NATS
 from nats.js.api import KeyValueConfig, StorageType
-from pydantic import AnyHttpUrl, BaseModel, Field
+
+from src.config import settings
+from src.schemas import MetricPayload, SiteConfig
 
 logger = logging.getLogger("pingpal-agent")
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+logging.basicConfig(level=settings.log_level)
 
 KV_BUCKET = "pingpal_config"
 KV_WATCH_PATTERN = "site.*"
@@ -28,14 +27,7 @@ NATS_METRICS_SUBJECT = "pingpal.metrics.ingest"
 KV_DEL = "DEL"
 KV_PURGE = "PURGE"
 
-AGENT_REGION = os.getenv("PINGPAL_REGION", "global")
-
-
-class SiteConfig(BaseModel):
-    site_id: UUID
-    url: AnyHttpUrl
-    interval: int = Field(ge=5, le=24 * 60 * 60)
-    is_active: bool = True
+AGENT_REGION = settings.pingpal_region
 
 
 @dataclass
@@ -47,8 +39,8 @@ class RunningTask:
     is_sleeping: bool = False
 
 
-def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+def utc_now_iso() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 async def ping_loop(
@@ -71,6 +63,9 @@ async def ping_loop(
             status_code = 0
             error_message: str | None = None
 
+            if "poison" in url:
+                raise RuntimeError("I died! Bruh...")
+
             try:
                 resp = await client.get(url, follow_redirects=True)
                 status_code = int(resp.status_code)
@@ -81,19 +76,18 @@ async def ping_loop(
 
             latency_ms = (time.perf_counter() - started) * 1000.0
 
-            payload: dict[str, Any] = {
-                "site_id": str(site_id),
-                "status_code": status_code,
-                "latency_ms": latency_ms,
-                "timestamp": utc_now_iso(),
-                "region": AGENT_REGION,
-            }
-            if error_message:
-                payload["error_message"] = error_message
+            metric = MetricPayload(
+                site_id=site_id,
+                region=AGENT_REGION,
+                status_code=status_code,
+                latency_ms=latency_ms,
+                timestamp=utc_now_iso(),
+                error_message=error_message,
+            )
 
             try:
                 await nc.publish(
-                    NATS_METRICS_SUBJECT, json.dumps(payload).encode("utf-8")
+                    NATS_METRICS_SUBJECT, metric.model_dump_json().encode("utf-8")
                 )
             except Exception:
                 logger.exception("Failed to publish metric for site_id=%s", site_id)
@@ -134,7 +128,7 @@ async def ensure_kv_bucket(nc: NATS):
 
 
 async def main() -> None:
-    nats_url = os.getenv("NATS_URL", "nats://127.0.0.1:4222")
+    nats_url = settings.nats_url
 
     nc = NATS()
     await nc.connect(
@@ -150,6 +144,21 @@ async def main() -> None:
 
     timeout = httpx.Timeout(connect=5.0, read=10.0, write=10.0, pool=5.0)
     async with httpx.AsyncClient(timeout=timeout) as client:
+
+        def on_task_done(t: asyncio.Task, site_id: UUID) -> None:
+            try:
+                exc = t.exception()
+                if exc and not isinstance(exc, asyncio.CancelledError):
+                    logger.error(f"Task for site {site_id} crashed: {exc}")
+                else:
+                    logger.info(f"Task for site {site_id} finished gracefully")
+            except asyncio.CancelledError:
+                pass
+
+            if site_id in tasks:
+                if tasks[site_id].task == t:
+                    del tasks[site_id]
+                    logger.info(f"Removed dead task for site {site_id} from registry")
 
         async def stop_task(site_id: UUID) -> None:
             rt = tasks.pop(site_id, None)
@@ -201,6 +210,7 @@ async def main() -> None:
                     rt_state=rt,  # forward running task there
                 )
             )
+            t.add_done_callback(lambda task: on_task_done(task, cfg.site_id))
 
             rt.task = t
             tasks[cfg.site_id] = rt
@@ -254,8 +264,7 @@ async def main() -> None:
                         continue
 
                     try:
-                        raw = json.loads(entry.value.decode("utf-8"))
-                        cfg = SiteConfig(**raw)
+                        cfg = SiteConfig.model_validate_json(entry.value)
                         await start_or_restart_task(cfg)
                     except Exception:
                         logger.exception("Failed to handle KV PUT key=%s", key)

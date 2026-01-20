@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -17,6 +15,7 @@ from pydantic import AnyHttpUrl, BaseModel, Field
 from sqlalchemy import func, insert, select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
+from src.config import settings
 from src.database import (
     Metric,
     Site,
@@ -25,19 +24,14 @@ from src.database import (
     create_sessionmaker,
     wait_for_db,
 )
+from src.schemas import MetricPayload, SiteConfig, SiteHealth
 
 logger = logging.getLogger("pingpal-core")
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+logging.basicConfig(level=settings.log_level)
 
 KV_BUCKET = "pingpal_config"
 KV_KEY_PREFIX = "site."
 NATS_METRICS_SUBJECT = "pingpal.metrics.ingest"
-
-
-class SiteHealth(BaseModel):
-    site_id: UUID
-    status: str  # "UP", "DOWN", "PARTIAL_OUTAGE", "UNKNOWN"
-    failing_regions: list[str]
 
 
 class SiteCreate(BaseModel):
@@ -61,28 +55,6 @@ class SiteStatsOut(BaseModel):
     last_check_at: datetime | None
 
 
-class MetricIngest(BaseModel):
-    site_id: UUID
-    region: str
-    status_code: int
-    latency_ms: float
-    timestamp: datetime
-    error_message: str | None = None
-
-
-def _parse_dt(value: Any) -> datetime:
-    if isinstance(value, datetime):
-        dt = value
-    elif isinstance(value, str):
-        dt = datetime.fromisoformat(value)
-    else:
-        raise ValueError("invalid timestamp")
-
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
-
-
 async def get_session(request: Request) -> AsyncSession:
     sessionmaker: async_sessionmaker[AsyncSession] = request.app.state.sessionmaker
     async with sessionmaker() as session:
@@ -94,13 +66,13 @@ def _site_key(site_id: UUID) -> str:
 
 
 def _site_value(site: Site) -> bytes:
-    payload = {
-        "site_id": str(site.id),
-        "url": site.url,
-        "interval": site.interval,
-        "is_active": site.is_active,
-    }
-    return json.dumps(payload).encode("utf-8")
+    payload = SiteConfig(
+        site_id=str(site.id),  # pyright: ignore[reportArgumentType]
+        url=site.url,  # pyright: ignore[reportArgumentType]
+        interval=site.interval,
+        is_active=site.is_active,
+    )
+    return payload.model_dump_json().encode("utf-8")
 
 
 async def _ensure_kv_bucket(nc: NATS):
@@ -223,7 +195,7 @@ async def lifespan(app: FastAPI):
     await wait_for_db(engine)
 
     # NATS + KV
-    nats_url = os.getenv("NATS_URL", "nats://127.0.0.1:4222")
+    nats_url = settings.nats_url
     nc = NATS()
     await nc.connect(
         servers=[nats_url],
@@ -244,22 +216,14 @@ async def lifespan(app: FastAPI):
 
     async def on_metric_msg(msg):
         try:
-            data = json.loads(msg.data.decode("utf-8"))
-            ingest = MetricIngest(
-                site_id=UUID(str(data["site_id"])),
-                region=data["region"],
-                status_code=int(data["status_code"]),
-                latency_ms=float(data["latency_ms"]),
-                timestamp=_parse_dt(data["timestamp"]),
-                error_message=(data.get("error_message") or None),
-            )
+            payload = MetricPayload.model_validate_json(msg.data)
             row = {
-                "time": ingest.timestamp,
-                "site_id": ingest.site_id,
-                "region": ingest.region,
-                "status_code": ingest.status_code,
-                "latency_ms": ingest.latency_ms,
-                "error_message": ingest.error_message,
+                "time": payload.timestamp,
+                "site_id": payload.site_id,
+                "region": payload.region,
+                "status_code": payload.status_code,
+                "latency_ms": payload.latency_ms,
+                "error_message": payload.error_message,
             }
             metrics_queue.put_nowait(row)
         except asyncio.QueueFull:
