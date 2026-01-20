@@ -199,6 +199,7 @@ async def lifespan(app: FastAPI):
     nc = NATS()
     await nc.connect(
         servers=[nats_url],
+        tls=settings.ssl_context,
         name="pingpal-core",
         reconnect_time_wait=2,
         max_reconnect_attempts=-1,

@@ -1,3 +1,4 @@
+import ssl
 from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -30,6 +31,14 @@ class Settings(BaseSettings):
     # Agent Specific
     pingpal_region: str = "global"
 
+    # Security (TLS)
+    # For Docker by default
+    tls_ca_cert: str = "/app/certs/ca.crt"
+    tls_cert: str = (
+        "/app/certs/client-core.crt"  # Must be redefine for Agent/s via ENV variables
+    )
+    tls_key: str = "/app/certs/client-core.key"
+
     @property
     def db_url(self) -> str:
         if self.database_url:
@@ -47,6 +56,14 @@ class Settings(BaseSettings):
             raise
 
         return f"postgresql+asyncpg://{self.pingpal_db_user}:{password}@{self.pingpal_db_host}:{self.pingpal_db_port}/{self.pingpal_db_name}"
+
+    @property
+    def ssl_context(self) -> ssl.SSLContext:
+        ctx = ssl.create_default_context(purpose=ssl.Purpose.SERVER_AUTH)
+        ctx.load_verify_locations(cafile=self.tls_ca_cert)
+        ctx.load_cert_chain(certfile=self.tls_cert, keyfile=self.tls_key)
+
+        return ctx
 
 
 settings = Settings()

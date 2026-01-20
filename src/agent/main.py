@@ -63,9 +63,6 @@ async def ping_loop(
             status_code = 0
             error_message: str | None = None
 
-            if "poison" in url:
-                raise RuntimeError("I died! Bruh...")
-
             try:
                 resp = await client.get(url, follow_redirects=True)
                 status_code = int(resp.status_code)
@@ -133,6 +130,7 @@ async def main() -> None:
     nc = NATS()
     await nc.connect(
         servers=[nats_url],
+        tls=settings.ssl_context,
         name="pingpal-agent",
         reconnect_time_wait=2,
         max_reconnect_attempts=-1,
