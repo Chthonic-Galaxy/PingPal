@@ -10,6 +10,7 @@ class SiteConfig(BaseModel):
     url: AnyHttpUrl
     interval: int = Field(ge=5, le=24 * 60 * 60)
     is_active: bool = True
+    regions: list[str] = Field(default_factory=lambda: ["global"])
 
 
 class MetricPayload(BaseModel):

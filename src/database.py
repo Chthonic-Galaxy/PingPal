@@ -13,6 +13,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    ARRAY,
 )
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.exc import OperationalError
@@ -41,6 +42,7 @@ class Site(Base):
     url: Mapped[str] = mapped_column(String(2048), nullable=False)
     interval: Mapped[int] = mapped_column(Integer, nullable=False, default=60)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    regions: Mapped[list[str]] = mapped_column(ARRAY(String), nullable=False, server_default=text("'{\"global\"}'"))
     created_at: Mapped[object] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -60,7 +62,7 @@ class Metric(Base):
         primary_key=True,
     )
     region: Mapped[str] = mapped_column(
-        String(50), nullable=False, server_default="global"
+        String(50), nullable=False, server_default="global", primary_key=True
     )
     status_code: Mapped[int] = mapped_column(Integer, nullable=False)
     latency_ms: Mapped[float] = mapped_column(Float, nullable=False)
