@@ -172,8 +172,16 @@ async def main() -> None:
             logger.info("Stopped task site_id=%s", site_id)
 
         async def start_or_restart_task(cfg: SiteConfig) -> None:
-            if not cfg.is_active:
+            should_run = False
+            if "global" in cfg.regions:
+                should_run = True
+            if AGENT_REGION in cfg.regions:
+                should_run = True
+            
+            if not should_run or not cfg.is_active:
                 await stop_task(cfg.site_id)
+                if not should_run and cfg.is_active:
+                    logger.debug(f"Skipping site {cfg.site_id} (Target: {cfg.regions}, Me: {AGENT_REGION})")
                 return
 
             existing = tasks.get(cfg.site_id)

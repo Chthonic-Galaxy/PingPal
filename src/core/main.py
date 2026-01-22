@@ -37,6 +37,11 @@ NATS_METRICS_SUBJECT = "pingpal.metrics.ingest"
 class SiteCreate(BaseModel):
     url: AnyHttpUrl
     interval: int = Field(default=60, ge=5, le=24 * 60 * 60)
+    regions: list[str] = Field(
+        min_length=1,
+        default_factory=lambda: ["global"],
+        examples=[["us-east", "eu-central"]],
+    )
 
 
 class SiteOut(BaseModel):
@@ -44,6 +49,7 @@ class SiteOut(BaseModel):
     url: str
     interval: int
     is_active: bool
+    regions: list[str]
     created_at: datetime
 
 
@@ -71,6 +77,7 @@ def _site_value(site: Site) -> bytes:
         url=site.url,  # pyright: ignore[reportArgumentType]
         interval=site.interval,
         is_active=site.is_active,
+        regions=site.regions,
     )
     return payload.model_dump_json().encode("utf-8")
 
@@ -265,7 +272,11 @@ async def create_site(
     payload: SiteCreate, session: AsyncSession = Depends(get_session)
 ):
     site = Site(
-        id=uuid4(), url=str(payload.url), interval=payload.interval, is_active=True
+        id=uuid4(),
+        url=str(payload.url),
+        interval=payload.interval,
+        is_active=True,
+        regions=payload.regions,
     )
     session.add(site)
     await session.commit()
@@ -282,6 +293,7 @@ async def create_site(
         url=site.url,
         interval=site.interval,
         is_active=site.is_active,
+        regions=site.regions,
         created_at=site.created_at,  # type: ignore[arg-type]
     )
 
