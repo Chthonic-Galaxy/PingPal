@@ -4,12 +4,13 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID, uuid4
 
 import nats.js.errors as js_errors
 from fastapi import Depends, FastAPI, HTTPException, Path, Query, Request
 from nats.aio.client import Client as NATS
+from nats.aio.subscription import Subscription as NATSSubscription
 from nats.js.api import KeyValueConfig, StorageType
 from pydantic import AnyHttpUrl, BaseModel, Field
 from sqlalchemy import func, insert, select
@@ -24,7 +25,7 @@ from src.database import (
     create_sessionmaker,
     wait_for_db,
 )
-from src.schemas import MetricPayload, SiteConfig, SiteHealth
+from src.schemas import AgentHeartbeat, MetricPayload, SiteConfig, SiteHealth
 
 logger = logging.getLogger("pingpal-core")
 logging.basicConfig(level=settings.log_level)
@@ -32,6 +33,8 @@ logging.basicConfig(level=settings.log_level)
 KV_BUCKET = "pingpal_config"
 KV_KEY_PREFIX = "site."
 NATS_METRICS_SUBJECT = "pingpal.metrics.ingest"
+
+active_agents: dict[str, AgentHeartbeat] = {}  # TODO: replace by Redis
 
 
 class SiteCreate(BaseModel):
@@ -61,10 +64,26 @@ class SiteStatsOut(BaseModel):
     last_check_at: datetime | None
 
 
+class AgentStatusOut(BaseModel):
+    agent_id: str
+    region: str
+    status: Literal["ONLINE", "OFFLINE"]
+    last_seen_seconds_ago: float
+    started_at: datetime
+
+
 async def get_session(request: Request) -> AsyncSession:
     sessionmaker: async_sessionmaker[AsyncSession] = request.app.state.sessionmaker
     async with sessionmaker() as session:
         yield session
+
+
+async def on_heartbeat_msg(msg):
+    try:
+        data = AgentHeartbeat.model_validate_json(msg.data)
+        active_agents[data.agent_id] = data
+    except Exception:
+        logger.exception("Bad heartbeat")
 
 
 def _site_key(site_id: UUID) -> str:
@@ -239,7 +258,13 @@ async def lifespan(app: FastAPI):
         except Exception:
             logger.exception("Failed to parse/queue metric message")
 
-    sub = await nc.subscribe(NATS_METRICS_SUBJECT, cb=on_metric_msg)
+    subscriptions: dict[str, NATSSubscription] = {}
+    subscriptions["metrics"] = await nc.subscribe(
+        NATS_METRICS_SUBJECT, cb=on_metric_msg
+    )
+    subscriptions["agent_heartbeat"] = await nc.subscribe(
+        "pingpal.agents.heartbeat", cb=on_heartbeat_msg
+    )
     worker_task = asyncio.create_task(_metrics_db_worker(sessionmaker, metrics_queue))
 
     try:
@@ -249,7 +274,8 @@ async def lifespan(app: FastAPI):
         await asyncio.gather(worker_task, return_exceptions=True)
 
         try:
-            await sub.unsubscribe()
+            for sub in subscriptions.values():
+                await sub.unsubscribe()
         except Exception:
             pass
 
@@ -315,6 +341,31 @@ async def list_sites(session: AsyncSession = Depends(get_session)):
         )
         for s in sites
     ]
+
+
+@app.get("/agents", response_model=list[AgentStatusOut])
+async def list_agents():
+    now = datetime.now(timezone.utc)
+    results = []
+
+    for agent_id, hb in active_agents.items():
+        delta = (now - hb.timestamp).total_seconds()
+
+        status = "ONLINE"
+        if delta > 30:
+            status = "OFFLINE"
+
+        results.append(
+            AgentStatusOut(
+                agent_id=hb.agent_id,
+                region=hb.region,
+                status=status,
+                last_seen_seconds_ago=delta,
+                started_at=hb.started_at,
+            )
+        )
+
+    return results
 
 
 @app.delete("/sites/{site_id}", status_code=204)

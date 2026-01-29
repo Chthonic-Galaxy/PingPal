@@ -26,3 +26,11 @@ class SiteHealth(BaseModel):
     site_id: UUID
     status: Literal["UP", "DOWN", "PARTIAL_OUTAGE", "UNKNOWN"]
     failing_regions: list[str]
+
+
+class AgentHeartbeat(BaseModel):
+    agent_id: str
+    region: str
+    timestamp: datetime
+    is_busy: bool = False
+    started_at: datetime

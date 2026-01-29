@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import signal
+import socket
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -15,7 +16,7 @@ from nats.aio.client import Client as NATS
 from nats.js.api import KeyValueConfig, StorageType
 
 from src.config import settings
-from src.schemas import MetricPayload, SiteConfig
+from src.schemas import AgentHeartbeat, MetricPayload, SiteConfig
 
 logger = logging.getLogger("pingpal-agent")
 logging.basicConfig(level=settings.log_level)
@@ -41,6 +42,33 @@ class RunningTask:
 
 def utc_now_iso() -> datetime:
     return datetime.now(timezone.utc)
+
+
+async def heartbeat_loop(nc: NATS, stop_evt: asyncio.Event):
+    hostname = socket.gethostname()
+    started_at = utc_now_iso()
+
+    logger.info(f"Heartbeat loop started. ID: {hostname}, Region: {AGENT_REGION}")
+
+    while not stop_evt.is_set():
+        try:
+            hb = AgentHeartbeat(
+                agent_id=hostname,
+                region=AGENT_REGION,
+                timestamp=utc_now_iso(),
+                started_at=started_at,
+                # is_busy= #TODO
+            )
+
+            await nc.publish("pingpal.agents.heartbeat", hb.model_dump_json().encode())
+
+        except Exception:
+            logger.exception("Failed to send heartbeat")
+
+        try:
+            await asyncio.wait_for(stop_evt.wait(), timeout=10.0)
+        except asyncio.TimeoutError:
+            pass
 
 
 async def ping_loop(
@@ -177,11 +205,13 @@ async def main() -> None:
                 should_run = True
             if AGENT_REGION in cfg.regions:
                 should_run = True
-            
+
             if not should_run or not cfg.is_active:
                 await stop_task(cfg.site_id)
                 if not should_run and cfg.is_active:
-                    logger.debug(f"Skipping site {cfg.site_id} (Target: {cfg.regions}, Me: {AGENT_REGION})")
+                    logger.debug(
+                        f"Skipping site {cfg.site_id} (Target: {cfg.regions}, Me: {AGENT_REGION})"
+                    )
                 return
 
             existing = tasks.get(cfg.site_id)
@@ -282,9 +312,11 @@ async def main() -> None:
                     pass
 
         watch_task = asyncio.create_task(kv_watch_loop())
+        hb_task = asyncio.create_task(heartbeat_loop(nc, shutdown_evt))
 
         await shutdown_evt.wait()
 
+        hb_task.cancel()
         watch_task.cancel()
         await asyncio.gather(watch_task, return_exceptions=True)
 
