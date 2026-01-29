@@ -1,6 +1,7 @@
 import ssl
 from pathlib import Path
 
+from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -31,13 +32,16 @@ class Settings(BaseSettings):
     # Agent Specific
     pingpal_region: str = "global"
 
-    # Security (TLS)
+    # Security
     # For Docker by default
+    ## (TLS)
     tls_ca_cert: str = "/app/certs/ca.crt"
     tls_cert: str = (
         "/app/certs/client-core.crt"  # Must be redefine for Agent/s via ENV variables
     )
     tls_key: str = "/app/certs/client-core.key"
+
+    app_api_key: SecretStr = "dev-secret-key"  # pyright: ignore[reportAssignmentType]
 
     @property
     def db_url(self) -> str:

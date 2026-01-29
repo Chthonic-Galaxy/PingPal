@@ -17,6 +17,7 @@ from sqlalchemy import func, insert, select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from src.config import settings
+from src.core.security import get_api_key
 from src.database import (
     Metric,
     Site,
@@ -290,7 +291,9 @@ async def lifespan(app: FastAPI):
         await engine.dispose()
 
 
-app = FastAPI(title="PingPal Core", lifespan=lifespan)
+app = FastAPI(
+    title="PingPal Core", lifespan=lifespan, dependencies=[Depends(get_api_key)]
+)
 
 
 @app.post("/sites", response_model=SiteOut, status_code=201)
@@ -337,6 +340,7 @@ async def list_sites(session: AsyncSession = Depends(get_session)):
             url=s.url,
             interval=s.interval,
             is_active=s.is_active,
+            regions=s.regions,
             created_at=s.created_at,  # type: ignore[arg-type]
         )
         for s in sites
