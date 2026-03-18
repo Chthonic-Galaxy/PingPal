@@ -1,16 +1,59 @@
 import ssl
+from functools import lru_cache
 from pathlib import Path
+from urllib.parse import quote_plus
 
-from pydantic import SecretStr
+from pydantic import BaseModel, PostgresDsn, SecretStr, computed_field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class DBSettings(BaseModel):
+    user: str = "pingpal"
+    password: str = "pingpal"
+    name: str = "pingpal"
+    host: str = "127.0.0.1"
+    port: int = 5432
+
+    echo: bool = False
+
+    pool_size: int = 0
+    pool_pre_ping: bool = False
+
+    @computed_field
+    @property
+    def url(self) -> str:
+        encoded_user = quote_plus(self.user)
+
+        password = self.password
+        try:
+            if Path("/run/secrets/pg_password").exists():
+                with open("/run/secrets/pg_password", "r") as f:
+                    password = f.read().strip()
+            elif Path("./secrets/pg_password.txt").exists():
+                with open("./secrets/pg_password.txt", "r") as f:
+                    password = f.read().strip()
+        except Exception:
+            raise
+
+        encoded_password = quote_plus(password)
+
+        return PostgresDsn.build(
+            scheme="postgresql+asyncpg",
+            username=encoded_user,
+            password=encoded_password,
+            host=self.host,
+            port=self.port,
+            path=self.name,
+        ).encoded_string()
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
-        extra="ignore",
+        env_nested_delimiter="__",
         case_sensitive=False,
+        extra="ignore",
     )
 
     # App
@@ -20,14 +63,7 @@ class Settings(BaseSettings):
     nats_url: str = "nats://127.0.0.1:4222"
 
     # DB
-    database_url: str | None = None
-    pingpal_db_user: str = "pingpal"
-    pingpal_db_password: str = "pingpal"
-    pingpal_db_host: str = "127.0.0.1"
-    pingpal_db_port: int = 5432
-    pingpal_db_name: str = "pingpal"
-
-    db_echo: bool = False
+    database: DBSettings
 
     # Agent Specific
     pingpal_region: str = "global"
@@ -44,24 +80,6 @@ class Settings(BaseSettings):
     app_api_key: SecretStr = "dev-secret-key"  # pyright: ignore[reportAssignmentType]
 
     @property
-    def db_url(self) -> str:
-        if self.database_url:
-            return self.database_url
-
-        password = self.pingpal_db_password
-        try:
-            if Path("/run/secrets/pg_password").exists():
-                with open("/run/secrets/pg_password", "r") as f:
-                    password = f.read().strip()
-            elif Path("./secrets/pg_password.txt").exists():
-                with open("./secrets/pg_password.txt", "r") as f:
-                    password = f.read().strip()
-        except Exception:
-            raise
-
-        return f"postgresql+asyncpg://{self.pingpal_db_user}:{password}@{self.pingpal_db_host}:{self.pingpal_db_port}/{self.pingpal_db_name}"
-
-    @property
     def ssl_context(self) -> ssl.SSLContext:
         ctx = ssl.create_default_context(purpose=ssl.Purpose.SERVER_AUTH)
         ctx.load_verify_locations(cafile=self.tls_ca_cert)
@@ -70,4 +88,9 @@ class Settings(BaseSettings):
         return ctx
 
 
-settings = Settings()
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()  # pyright: ignore[reportCallIssue]
+
+
+settings = get_settings()
