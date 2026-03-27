@@ -1,3 +1,4 @@
+from datetime import datetime
 from uuid import UUID, uuid4
 
 from sqlalchemy import ARRAY, DateTime, String
@@ -21,7 +22,7 @@ class Site(Base):
     regions: Mapped[list[str]] = mapped_column(
         ARRAY(String), nullable=False, server_default=text("'{\"global\"}'")
     )
-    created_at: Mapped[object] = mapped_column(
+    created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
 
