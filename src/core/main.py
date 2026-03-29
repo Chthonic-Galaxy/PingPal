@@ -17,6 +17,7 @@ from sqlalchemy import func, insert, select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from src.config import settings
+from src.core.routers.dependencies import active_agents
 from src.core.security import get_api_key
 from src.database import (
     Metric,
@@ -34,8 +35,6 @@ logging.basicConfig(level=settings.log_level)
 KV_BUCKET = "pingpal_config"
 KV_KEY_PREFIX = "site."
 NATS_METRICS_SUBJECT = "pingpal.metrics.ingest"
-
-active_agents: dict[str, AgentHeartbeat] = {}  # TODO: replace by Redis
 
 
 async def on_heartbeat_msg(msg):

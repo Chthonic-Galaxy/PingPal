@@ -1,4 +1,14 @@
-@app.get("/agents", response_model=list[AgentStatusOut])
+from datetime import datetime, timezone
+
+from fastapi import APIRouter
+
+from src.core.routers.dependencies import active_agents
+from src.schemas import AgentStatusOut
+
+router = APIRouter(prefix="agents/", tags=["agents"])
+
+
+@router.get("", response_model=list[AgentStatusOut])
 async def list_agents():
     now = datetime.now(timezone.utc)
     results = []

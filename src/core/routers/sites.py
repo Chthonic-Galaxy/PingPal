@@ -1,4 +1,11 @@
-from fastapi import APIRouter
+from datetime import datetime, timedelta, timezone
+from uuid import UUID, uuid4
+
+from fastapi import APIRouter, Depends, Path, Query
+from fastapi.exceptions import HTTPException
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.status import HTTP_201_CREATED, HTTP_204_NO_CONTENT, HTTP_404_NOT_FOUND
 
 from src.core.routers.dependencies import get_db_session
 from src.infrastructure.database.models import (
@@ -7,10 +14,10 @@ from src.infrastructure.database.models import (
 )
 from src.schemas import SiteCreate, SiteHealth, SiteOut, SiteStatsOut
 
-router = APIRouter(prefix="/sites", tags=["sites"])
+router = APIRouter(prefix="sites/", tags=["sites"])
 
 
-@app.post("/sites", response_model=SiteOut, status_code=201)
+@router.post("", response_model=SiteOut, status_code=HTTP_201_CREATED)
 async def create_site(
     payload: SiteCreate, session: AsyncSession = Depends(get_db_session)
 ):
@@ -41,7 +48,7 @@ async def create_site(
     )
 
 
-@app.get("/sites", response_model=list[SiteOut])
+@router.get("", response_model=list[SiteOut])
 async def list_sites(session: AsyncSession = Depends(get_db_session)):
     sites = (
         (await session.execute(select(Site).order_by(Site.created_at.desc())))
@@ -61,7 +68,7 @@ async def list_sites(session: AsyncSession = Depends(get_db_session)):
     ]
 
 
-@app.delete("/sites/{site_id}", status_code=204)
+@router.delete("{site_id}", status_code=HTTP_204_NO_CONTENT)
 async def deactivate_site(
     site_id: UUID = Path(...),
     session: AsyncSession = Depends(get_db_session),
@@ -70,7 +77,7 @@ async def deactivate_site(
         await session.execute(select(Site).where(Site.id == site_id))
     ).scalar_one_or_none()
     if site is None:
-        raise HTTPException(status_code=404, detail="site not found")
+        raise HTTPException(status_code=HTTP_404_NOT_FOUND, detail="site not found")
 
     site.is_active = False
     await session.commit()
@@ -84,7 +91,7 @@ async def deactivate_site(
     return None
 
 
-@app.get("/sites/{site_id}/stats", response_model=SiteStatsOut)
+@router.get("{site_id}/stats", response_model=SiteStatsOut)
 async def site_stats(
     site_id: UUID = Path(...),
     region: str | None = Query(None),
@@ -92,7 +99,7 @@ async def site_stats(
 ):
     exists = await session.execute(select(Site.id).where(Site.id == site_id))
     if exists.scalar_one_or_none() is None:
-        raise HTTPException(status_code=404, detail="site not found")
+        raise HTTPException(status_code=HTTP_404_NOT_FOUND, detail="site not found")
 
     avg_latency_stmt = select(func.avg(Metric.latency_ms)).where(
         Metric.site_id == site_id,
@@ -130,14 +137,14 @@ async def site_stats(
     )
 
 
-@app.get("/sites/{site_id}/state", response_model=SiteHealth)
+@router.get("{site_id}/state", response_model=SiteHealth)
 async def check_health(
     site_id: UUID = Path(...),
     session: AsyncSession = Depends(get_db_session),
 ):
     exists = await session.execute(select(Site.id).where(Site.id == site_id))
     if exists.scalar_one_or_none() is None:
-        raise HTTPException(status_code=404, detail="site not found")
+        raise HTTPException(status_code=HTTP_404_NOT_FOUND, detail="site not found")
 
     stmt = (
         select(Metric.region, Metric.status_code)

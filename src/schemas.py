@@ -70,7 +70,7 @@ class AgentStatusOut(BaseModel):
 
 
 #!NOTE: This model is for MetricPayload
-# Sheme of work: Agent pings sites -> constructs this model -> sends to NATS Broker Message -> Agent Fetchs this data -> *Converts manualy this Model into DB Model* -> Starts Async Worker to flush this info into DB('batch method' if items >= 500 else flushes as is)
+# Sheme of work: Agent pings sites -> constructs this model -> sends to NATS Broker Message -> Core Fetchs this data -> *Converts manualy this Model into DB Model* -> Starts Async Worker to flush this info into DB('batch method' if items >= 500 else flushes as is)
 class MetricPayload(BaseModel):
     site_id: UUID
     region: str
