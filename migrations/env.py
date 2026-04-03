@@ -16,7 +16,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.database import Base, build_db_settings  # noqa: E402
+from src.config import settings  # noqa: E402
+from src.infrastructure.database.models import Base  # noqa: E402
 
 config = context.config
 
@@ -27,7 +28,7 @@ target_metadata = Base.metadata
 
 
 def get_url() -> str:
-    return build_db_settings().database_url
+    return settings.database.url
 
 
 def run_migrations_offline() -> None:

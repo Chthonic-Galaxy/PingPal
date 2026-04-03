@@ -1,3 +1,4 @@
+import logging
 from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
 
@@ -7,19 +8,29 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.status import HTTP_201_CREATED, HTTP_204_NO_CONTENT, HTTP_404_NOT_FOUND
 
-from src.core.routers.dependencies import get_db_session
+from src.api.dependencies import (
+    KVStore,
+    get_db_manual_session,
+    get_db_session,
+    get_nats_kv,
+)
+from src.core.utils import _site_key, _site_value
 from src.infrastructure.database.models import (
     Metric,
     Site,
 )
 from src.schemas import SiteCreate, SiteHealth, SiteOut, SiteStatsOut
 
-router = APIRouter(prefix="sites/", tags=["sites"])
+logger = logging.getLogger("endpoints-sites")
+
+router = APIRouter(prefix="/sites", tags=["sites"])
 
 
-@router.post("", response_model=SiteOut, status_code=HTTP_201_CREATED)
+@router.post("/", response_model=SiteOut, status_code=HTTP_201_CREATED)
 async def create_site(
-    payload: SiteCreate, session: AsyncSession = Depends(get_db_session)
+    payload: SiteCreate,
+    session: AsyncSession = Depends(get_db_manual_session),
+    kv: KVStore = Depends(get_nats_kv),
 ):
     site = Site(
         id=uuid4(),
@@ -32,7 +43,6 @@ async def create_site(
     await session.commit()
     await session.refresh(site)
 
-    kv = app.state.kv
     try:
         await kv.put(_site_key(site.id), _site_value(site))
     except Exception:
@@ -48,7 +58,7 @@ async def create_site(
     )
 
 
-@router.get("", response_model=list[SiteOut])
+@router.get("/", response_model=list[SiteOut])
 async def list_sites(session: AsyncSession = Depends(get_db_session)):
     sites = (
         (await session.execute(select(Site).order_by(Site.created_at.desc())))
@@ -68,10 +78,11 @@ async def list_sites(session: AsyncSession = Depends(get_db_session)):
     ]
 
 
-@router.delete("{site_id}", status_code=HTTP_204_NO_CONTENT)
+@router.delete("/{site_id}/", status_code=HTTP_204_NO_CONTENT)
 async def deactivate_site(
     site_id: UUID = Path(...),
-    session: AsyncSession = Depends(get_db_session),
+    session: AsyncSession = Depends(get_db_manual_session),
+    kv: KVStore = Depends(get_nats_kv),
 ):
     site = (
         await session.execute(select(Site).where(Site.id == site_id))
@@ -82,7 +93,6 @@ async def deactivate_site(
     site.is_active = False
     await session.commit()
 
-    kv = app.state.kv
     try:
         await kv.delete(_site_key(site_id))
     except Exception:
@@ -91,7 +101,7 @@ async def deactivate_site(
     return None
 
 
-@router.get("{site_id}/stats", response_model=SiteStatsOut)
+@router.get("/{site_id}/stats/", response_model=SiteStatsOut)
 async def site_stats(
     site_id: UUID = Path(...),
     region: str | None = Query(None),
@@ -137,7 +147,7 @@ async def site_stats(
     )
 
 
-@router.get("{site_id}/state", response_model=SiteHealth)
+@router.get("/{site_id}/state/", response_model=SiteHealth)
 async def check_health(
     site_id: UUID = Path(...),
     session: AsyncSession = Depends(get_db_session),

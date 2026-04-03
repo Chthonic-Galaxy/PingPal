@@ -23,3 +23,8 @@ async def get_sandbox_db_session() -> AsyncGenerator[AsyncSession]:
     async with async_session_factory() as session:
         yield session
         await session.rollback()
+
+
+async def get_db_manual_session() -> AsyncGenerator[AsyncSession]:
+    async with async_session_factory() as session:
+        yield session

@@ -11,24 +11,15 @@ from uuid import UUID
 
 import httpx
 import nats.errors
-import nats.js.errors as js_errors
 from nats.aio.client import Client as NATS
-from nats.js.api import KeyValueConfig, StorageType
 
 from src.config import settings
+from src.infrastructure.logger import setup_logging
+from src.infrastructure.message_broker.nats_client import NATSManager
 from src.schemas import AgentHeartbeat, MetricPayload, SiteConfig
 
+setup_logging(settings.log_level)
 logger = logging.getLogger("pingpal-agent")
-logging.basicConfig(level=settings.log_level)
-
-KV_BUCKET = "pingpal_config"
-KV_WATCH_PATTERN = "site.*"
-NATS_METRICS_SUBJECT = "pingpal.metrics.ingest"
-
-KV_DEL = "DEL"
-KV_PURGE = "PURGE"
-
-AGENT_REGION = settings.pingpal_region
 
 
 @dataclass
@@ -40,22 +31,20 @@ class RunningTask:
     is_sleeping: bool = False
 
 
-def utc_now_iso() -> datetime:
-    return datetime.now(timezone.utc)
-
-
 async def heartbeat_loop(nc: NATS, stop_evt: asyncio.Event):
     hostname = socket.gethostname()
-    started_at = utc_now_iso()
+    started_at = datetime.now(timezone.utc)
 
-    logger.info(f"Heartbeat loop started. ID: {hostname}, Region: {AGENT_REGION}")
+    logger.info(
+        f"Heartbeat loop started. ID: {hostname}, Region: {settings.pingpal_region}"
+    )
 
     while not stop_evt.is_set():
         try:
             hb = AgentHeartbeat(
                 agent_id=hostname,
-                region=AGENT_REGION,
-                timestamp=utc_now_iso(),
+                region=settings.pingpal_region,
+                timestamp=datetime.now(timezone.utc),
                 started_at=started_at,
                 # is_busy= #TODO
             )
@@ -103,16 +92,17 @@ async def ping_loop(
 
             metric = MetricPayload(
                 site_id=site_id,
-                region=AGENT_REGION,
+                region=settings.pingpal_region,
                 status_code=status_code,
                 latency_ms=latency_ms,
-                timestamp=utc_now_iso(),
+                timestamp=datetime.now(timezone.utc),
                 error_message=error_message,
             )
 
             try:
                 await nc.publish(
-                    NATS_METRICS_SUBJECT, metric.model_dump_json().encode("utf-8")
+                    settings.nats.metrics_subject,
+                    metric.model_dump_json().encode("utf-8"),
                 )
             except Exception:
                 logger.exception("Failed to publish metric for site_id=%s", site_id)
@@ -128,43 +118,18 @@ async def ping_loop(
         logger.exception("ping_loop crashed for site_id=%s", site_id)
 
 
-async def ensure_kv_bucket(nc: NATS):
-    js = nc.jetstream()
-
-    try:
-        return await js.key_value(KV_BUCKET)
-    except js_errors.NotFoundError:
-        pass
-
-    try:
-        await js.create_key_value(
-            KeyValueConfig(
-                bucket=KV_BUCKET,
-                description="PingPal site configuration (source of truth for Agents)",
-                storage=StorageType.FILE,
-                history=1,
-            )
-        )
-    except js_errors.APIError as e:
-        if getattr(e, "err_code", None) != 10058:
-            raise
-
-    return await js.key_value(KV_BUCKET)
-
-
 async def main() -> None:
-    nats_url = settings.nats_url
-
     nc = NATS()
-    await nc.connect(
-        servers=[nats_url],
+    nats_mgr = NATSManager(nc, settings)
+    await nats_mgr.connect(
+        servers=[settings.nats.url],
         tls=settings.ssl_context,
-        name="pingpal-agent",
+        name="pingpal-core",
         reconnect_time_wait=2,
         max_reconnect_attempts=-1,
     )
 
-    kv = await ensure_kv_bucket(nc)
+    nats_kv = await nats_mgr.get_kv()
 
     tasks: dict[UUID, RunningTask] = {}
 
@@ -203,14 +168,14 @@ async def main() -> None:
             should_run = False
             if "global" in cfg.regions:
                 should_run = True
-            if AGENT_REGION in cfg.regions:
+            if settings.pingpal_region in cfg.regions:
                 should_run = True
 
             if not should_run or not cfg.is_active:
                 await stop_task(cfg.site_id)
                 if not should_run and cfg.is_active:
                     logger.debug(
-                        f"Skipping site {cfg.site_id} (Target: {cfg.regions}, Me: {AGENT_REGION})"
+                        f"Skipping site {cfg.site_id} (Target: {cfg.regions}, Me: {settings.pingpal_region})"
                     )
                 return
 
@@ -272,7 +237,9 @@ async def main() -> None:
             Но `async for entry in watcher` завершится на первом None (см. __anext__),
             поэтому используем бесконечный while + watcher.updates().
             """
-            watcher = await kv.watch(KV_WATCH_PATTERN, include_history=True)
+            watcher = await nats_kv.watch(
+                settings.nats.kv_watch_pattern, include_history=True
+            )
 
             try:
                 while not shutdown_evt.is_set():
@@ -287,7 +254,7 @@ async def main() -> None:
                     op = entry.operation
                     key = entry.key
 
-                    if op in (KV_DEL, KV_PURGE):
+                    if op in (settings.nats.kv_del, settings.nats.kv_purge):
                         if key.startswith("site."):
                             raw_id = key.split("site.", 1)[1]
                             try:
@@ -325,13 +292,7 @@ async def main() -> None:
             return_exceptions=True,
         )
 
-    try:
-        await nc.drain()
-    except Exception:
-        try:
-            await nc.close()
-        except Exception:
-            pass
+    await nats_mgr.disconnect()
 
 
 if __name__ == "__main__":
