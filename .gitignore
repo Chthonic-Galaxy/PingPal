@@ -13,3 +13,7 @@ wheels/
 # Secrets
 secrets/
 .env
+certs/
+
+# Dev
+TODO.md

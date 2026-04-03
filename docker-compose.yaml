@@ -1,12 +1,18 @@
 services:
   nats:
     image: nats:latest
-    command: "-js -m 8222 -sd /data"
+    command: >
+      -js -m 8222 -sd /data
+      --tlscert /etc/nats/certs/server.crt
+      --tlskey /etc/nats/certs/server.key
+      --tlscacert /etc/nats/certs/ca.crt
+      --tlsverify
     ports:
       - "4222:4222" # For clients
       - "8222:8222" # For monitoring
     volumes:
       - nats_data:/data
+      - ./certs:/etc/nats/certs:ro
 
   db:
     container_name: pingpal_database
@@ -22,7 +28,8 @@ services:
     volumes:
       - pg_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U pingpal -d pingpal"]
+      test:
+        ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U pingpal -d pingpal"]
       interval: 2s
       timeout: 5s
       retries: 30
@@ -56,6 +63,8 @@ services:
       - PINGPAL_DB_NAME=pingpal
     secrets:
       - pg_password
+    volumes:
+      - ./certs:/app/certs:ro
     depends_on:
       migration:
         condition: service_completed_successfully
@@ -68,6 +77,44 @@ services:
     command: ["python", "-m", "src.agent.main"]
     environment:
       - NATS_URL=nats://nats:4222
+      - TLS_CERT=/app/certs/client-agent.crt
+      - TLS_KEY=/app/certs/client-agent.key
+    volumes:
+      - ./certs:/app/certs:ro
+    depends_on:
+      migration:
+        condition: service_completed_successfully
+      nats:
+        condition: service_started
+    restart: unless-stopped
+
+  agent-us:
+    build: .
+    command: ["python", "-m", "src.agent.main"]
+    environment:
+      - NATS_URL=nats://nats:4222
+      - TLS_CERT=/app/certs/client-agent.crt
+      - TLS_KEY=/app/certs/client-agent.key
+      - PINGPAL_REGION=us-east
+    volumes:
+      - ./certs:/app/certs:ro
+    depends_on:
+      migration:
+        condition: service_completed_successfully
+      nats:
+        condition: service_started
+    restart: unless-stopped
+
+  agent-eu:
+    build: .
+    command: ["python", "-m", "src.agent.main"]
+    environment:
+      - NATS_URL=nats://nats:4222
+      - TLS_CERT=/app/certs/client-agent.crt
+      - TLS_KEY=/app/certs/client-agent.key
+      - PINGPAL_REGION=eu-central
+    volumes:
+      - ./certs:/app/certs:ro
     depends_on:
       migration:
         condition: service_completed_successfully

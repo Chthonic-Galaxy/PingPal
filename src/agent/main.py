@@ -1,39 +1,25 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-import os
 import signal
+import socket
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
 from uuid import UUID
 
 import httpx
 import nats.errors
-import nats.js.errors as js_errors
 from nats.aio.client import Client as NATS
-from nats.js.api import KeyValueConfig, StorageType
-from pydantic import AnyHttpUrl, BaseModel, Field
 
+from src.config import settings
+from src.infrastructure.logger import setup_logging
+from src.infrastructure.message_broker.nats_client import NATSManager
+from src.schemas import AgentHeartbeat, MetricPayload, SiteConfig
+
+setup_logging(settings.log_level)
 logger = logging.getLogger("pingpal-agent")
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
-
-KV_BUCKET = "pingpal_config"
-KV_WATCH_PATTERN = "site.*"
-NATS_METRICS_SUBJECT = "pingpal.metrics.ingest"
-
-KV_DEL = "DEL"
-KV_PURGE = "PURGE"
-
-
-class SiteConfig(BaseModel):
-    site_id: UUID
-    url: AnyHttpUrl
-    interval: int = Field(ge=5, le=24 * 60 * 60)
-    is_active: bool = True
 
 
 @dataclass
@@ -42,10 +28,36 @@ class RunningTask:
     task: asyncio.Task[None]
     url: str
     interval: int
+    is_sleeping: bool = False
 
 
-def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+async def heartbeat_loop(nc: NATS, stop_evt: asyncio.Event):
+    hostname = socket.gethostname()
+    started_at = datetime.now(timezone.utc)
+
+    logger.info(
+        f"Heartbeat loop started. ID: {hostname}, Region: {settings.pingpal_region}"
+    )
+
+    while not stop_evt.is_set():
+        try:
+            hb = AgentHeartbeat(
+                agent_id=hostname,
+                region=settings.pingpal_region,
+                timestamp=datetime.now(timezone.utc),
+                started_at=started_at,
+                # is_busy= #TODO
+            )
+
+            await nc.publish("pingpal.agents.heartbeat", hb.model_dump_json().encode())
+
+        except Exception:
+            logger.exception("Failed to send heartbeat")
+
+        try:
+            await asyncio.wait_for(stop_evt.wait(), timeout=10.0)
+        except asyncio.TimeoutError:
+            pass
 
 
 async def ping_loop(
@@ -56,11 +68,14 @@ async def ping_loop(
     nc: NATS,
     client: httpx.AsyncClient,
     stop: asyncio.Event,
+    rt_state: RunningTask,
 ) -> None:
     interval = max(1, int(interval))
 
     try:
         while not stop.is_set():
+            rt_state.is_sleeping = False
+
             started = time.perf_counter()
             status_code = 0
             error_message: str | None = None
@@ -75,22 +90,24 @@ async def ping_loop(
 
             latency_ms = (time.perf_counter() - started) * 1000.0
 
-            payload: dict[str, Any] = {
-                "site_id": str(site_id),
-                "status_code": status_code,
-                "latency_ms": latency_ms,
-                "timestamp": utc_now_iso(),
-            }
-            if error_message:
-                payload["error_message"] = error_message
+            metric = MetricPayload(
+                site_id=site_id,
+                region=settings.pingpal_region,
+                status_code=status_code,
+                latency_ms=latency_ms,
+                timestamp=datetime.now(timezone.utc),
+                error_message=error_message,
+            )
 
             try:
                 await nc.publish(
-                    NATS_METRICS_SUBJECT, json.dumps(payload).encode("utf-8")
+                    settings.nats.metrics_subject,
+                    metric.model_dump_json().encode("utf-8"),
                 )
             except Exception:
                 logger.exception("Failed to publish metric for site_id=%s", site_id)
 
+            rt_state.is_sleeping = True
             try:
                 await asyncio.wait_for(stop.wait(), timeout=interval)
             except asyncio.TimeoutError:
@@ -101,60 +118,65 @@ async def ping_loop(
         logger.exception("ping_loop crashed for site_id=%s", site_id)
 
 
-async def ensure_kv_bucket(nc: NATS):
-    js = nc.jetstream()
-
-    try:
-        return await js.key_value(KV_BUCKET)
-    except js_errors.NotFoundError:
-        pass
-
-    try:
-        await js.create_key_value(
-            KeyValueConfig(
-                bucket=KV_BUCKET,
-                description="PingPal site configuration (source of truth for Agents)",
-                storage=StorageType.FILE,
-                history=1,
-            )
-        )
-    except js_errors.APIError as e:
-        if getattr(e, "err_code", None) != 10058:
-            raise
-
-    return await js.key_value(KV_BUCKET)
-
-
 async def main() -> None:
-    nats_url = os.getenv("NATS_URL", "nats://127.0.0.1:4222")
-
     nc = NATS()
-    await nc.connect(
-        servers=[nats_url],
-        name="pingpal-agent",
+    nats_mgr = NATSManager(nc, settings)
+    await nats_mgr.connect(
+        servers=[settings.nats.url],
+        tls=settings.ssl_context,
+        name="pingpal-core",
         reconnect_time_wait=2,
         max_reconnect_attempts=-1,
     )
 
-    kv = await ensure_kv_bucket(nc)
+    nats_kv = await nats_mgr.get_kv()
 
     tasks: dict[UUID, RunningTask] = {}
 
     timeout = httpx.Timeout(connect=5.0, read=10.0, write=10.0, pool=5.0)
     async with httpx.AsyncClient(timeout=timeout) as client:
 
+        def on_task_done(t: asyncio.Task, site_id: UUID) -> None:
+            try:
+                exc = t.exception()
+                if exc and not isinstance(exc, asyncio.CancelledError):
+                    logger.error(f"Task for site {site_id} crashed: {exc}")
+                else:
+                    logger.info(f"Task for site {site_id} finished gracefully")
+            except asyncio.CancelledError:
+                pass
+
+            if site_id in tasks:
+                if tasks[site_id].task == t:
+                    del tasks[site_id]
+                    logger.info(f"Removed dead task for site {site_id} from registry")
+
         async def stop_task(site_id: UUID) -> None:
             rt = tasks.pop(site_id, None)
             if not rt:
                 return
             rt.stop.set()
-            rt.task.cancel()
+            if rt.is_sleeping:
+                rt.task.cancel()
+                logger.info("Cancelling sleeping task site_id=%s", site_id)
+            else:
+                logger.info("Waiting for busy task to finish site_id=%s", site_id)
             await asyncio.gather(rt.task, return_exceptions=True)
             logger.info("Stopped task site_id=%s", site_id)
 
         async def start_or_restart_task(cfg: SiteConfig) -> None:
-            if not cfg.is_active:
+            should_run = False
+            if "global" in cfg.regions:
+                should_run = True
+            if settings.pingpal_region in cfg.regions:
+                should_run = True
+
+            if not should_run or not cfg.is_active:
                 await stop_task(cfg.site_id)
+                if not should_run and cfg.is_active:
+                    logger.debug(
+                        f"Skipping site {cfg.site_id} (Target: {cfg.regions}, Me: {settings.pingpal_region})"
+                    )
                 return
 
             existing = tasks.get(cfg.site_id)
@@ -169,6 +191,15 @@ async def main() -> None:
                 await stop_task(cfg.site_id)
 
             stop_evt = asyncio.Event()
+            # task config pre-creating
+            rt = RunningTask(
+                stop=stop_evt,
+                task=None,  # pyright: ignore[reportArgumentType]
+                url=str(cfg.url),
+                interval=int(cfg.interval),
+                is_sleeping=False,
+            )
+
             t = asyncio.create_task(
                 ping_loop(
                     site_id=cfg.site_id,
@@ -177,14 +208,14 @@ async def main() -> None:
                     nc=nc,
                     client=client,
                     stop=stop_evt,
+                    rt_state=rt,  # forward running task there
                 )
             )
-            tasks[cfg.site_id] = RunningTask(
-                stop=stop_evt,
-                task=t,
-                url=str(cfg.url),
-                interval=int(cfg.interval),
-            )
+            t.add_done_callback(lambda task: on_task_done(task, cfg.site_id))
+
+            rt.task = t
+            tasks[cfg.site_id] = rt
+
             logger.info(
                 "Started task site_id=%s interval=%s url=%s",
                 cfg.site_id,
@@ -206,7 +237,9 @@ async def main() -> None:
             Но `async for entry in watcher` завершится на первом None (см. __anext__),
             поэтому используем бесконечный while + watcher.updates().
             """
-            watcher = await kv.watch(KV_WATCH_PATTERN, include_history=True)
+            watcher = await nats_kv.watch(
+                settings.nats.kv_watch_pattern, include_history=True
+            )
 
             try:
                 while not shutdown_evt.is_set():
@@ -221,7 +254,7 @@ async def main() -> None:
                     op = entry.operation
                     key = entry.key
 
-                    if op in (KV_DEL, KV_PURGE):
+                    if op in (settings.nats.kv_del, settings.nats.kv_purge):
                         if key.startswith("site."):
                             raw_id = key.split("site.", 1)[1]
                             try:
@@ -234,8 +267,7 @@ async def main() -> None:
                         continue
 
                     try:
-                        raw = json.loads(entry.value.decode("utf-8"))
-                        cfg = SiteConfig(**raw)
+                        cfg = SiteConfig.model_validate_json(entry.value)
                         await start_or_restart_task(cfg)
                     except Exception:
                         logger.exception("Failed to handle KV PUT key=%s", key)
@@ -247,9 +279,11 @@ async def main() -> None:
                     pass
 
         watch_task = asyncio.create_task(kv_watch_loop())
+        hb_task = asyncio.create_task(heartbeat_loop(nc, shutdown_evt))
 
         await shutdown_evt.wait()
 
+        hb_task.cancel()
         watch_task.cancel()
         await asyncio.gather(watch_task, return_exceptions=True)
 
@@ -258,13 +292,7 @@ async def main() -> None:
             return_exceptions=True,
         )
 
-    try:
-        await nc.drain()
-    except Exception:
-        try:
-            await nc.close()
-        except Exception:
-            pass
+    await nats_mgr.disconnect()
 
 
 if __name__ == "__main__":
