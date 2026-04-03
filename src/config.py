@@ -47,6 +47,20 @@ class DBSettings(BaseModel):
         ).encoded_string()
 
 
+class NATSSettings(BaseModel):
+    url: str = "nats://127.0.0.1:4222"
+
+    kv_bucket: str = "pingpal_config"
+    kv_key_prefix: str = "site."
+    kv_watch_pattern: str = "site.*"
+
+    kv_del: str = "DEL"
+    kv_purge: str = "PURGE"
+
+    metrics_subject: str = "pingpal.metrics.ingest"
+    agents_heartbeat_subject: str = "pingpal.agents.heartbeat"
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -60,7 +74,7 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
 
     # NATS
-    nats_url: str = "nats://127.0.0.1:4222"
+    nats: NATSSettings
 
     # DB
     database: DBSettings
