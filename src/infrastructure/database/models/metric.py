@@ -5,7 +5,6 @@ from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from src.infrastructure.database.models.base import Base
-from src.infrastructure.database.models.site import Site
 
 
 class Metric(Base):
@@ -24,4 +23,4 @@ class Metric(Base):
     latency_ms: Mapped[float] = mapped_column(nullable=False)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
 
-    site: Mapped["Site"] = relationship(back_populates="metrics")
+    site: Mapped["Site"] = relationship(back_populates="metrics")  # noqa: F821  # pyright: ignore[reportUndefinedVariable]

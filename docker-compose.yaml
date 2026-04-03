@@ -38,10 +38,10 @@ services:
     build: .
     command: ["alembic", "upgrade", "head"]
     environment:
-      - PINGPAL_DB_HOST=db
-      - PINGPAL_DB_PORT=5432
-      - PINGPAL_DB_USER=pingpal
-      - PINGPAL_DB_NAME=pingpal
+      - DATABASE__HOST=db
+      - DATABASE__PORT=5432
+      - DATABASE__USER=pingpal
+      - DATABASE__NAME=pingpal
     secrets:
       - pg_password
     depends_on:
@@ -56,11 +56,11 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - NATS_URL=nats://nats:4222
-      - PINGPAL_DB_HOST=db
-      - PINGPAL_DB_PORT=5432
-      - PINGPAL_DB_USER=pingpal
-      - PINGPAL_DB_NAME=pingpal
+      - NATS__URL=nats://nats:4222
+      - DATABASE__HOST=db
+      - DATABASE__PORT=5432
+      - DATABASE__USER=pingpal
+      - DATABASE__NAME=pingpal
     secrets:
       - pg_password
     volumes:
@@ -76,9 +76,10 @@ services:
     build: .
     command: ["python", "-m", "src.agent.main"]
     environment:
-      - NATS_URL=nats://nats:4222
+      - NATS__URL=nats://nats:4222
       - TLS_CERT=/app/certs/client-agent.crt
       - TLS_KEY=/app/certs/client-agent.key
+      - DATABASE__HOST=db
     volumes:
       - ./certs:/app/certs:ro
     depends_on:
@@ -92,9 +93,10 @@ services:
     build: .
     command: ["python", "-m", "src.agent.main"]
     environment:
-      - NATS_URL=nats://nats:4222
+      - NATS__URL=nats://nats:4222
       - TLS_CERT=/app/certs/client-agent.crt
       - TLS_KEY=/app/certs/client-agent.key
+      - DATABASE__HOST=db
       - PINGPAL_REGION=us-east
     volumes:
       - ./certs:/app/certs:ro
@@ -109,9 +111,10 @@ services:
     build: .
     command: ["python", "-m", "src.agent.main"]
     environment:
-      - NATS_URL=nats://nats:4222
+      - NATS__URL=nats://nats:4222
       - TLS_CERT=/app/certs/client-agent.crt
       - TLS_KEY=/app/certs/client-agent.key
+      - DATABASE__HOST=db
       - PINGPAL_REGION=eu-central
     volumes:
       - ./certs:/app/certs:ro

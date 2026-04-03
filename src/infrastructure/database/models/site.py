@@ -7,7 +7,6 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.sql import func, text
 
 from src.infrastructure.database.models.base import Base
-from src.infrastructure.database.models.metric import Metric
 
 
 class Site(Base):
@@ -26,6 +25,6 @@ class Site(Base):
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
 
-    metrics: Mapped[list["Metric"]] = relationship(
+    metrics: Mapped[list["Metric"]] = relationship(  # noqa: F821  # pyright: ignore[reportUndefinedVariable]
         back_populates="site", cascade="all, delete-orphan"
     )

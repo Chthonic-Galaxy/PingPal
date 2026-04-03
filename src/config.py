@@ -1,41 +1,46 @@
+import os
 import ssl
 from functools import lru_cache
 from pathlib import Path
 from urllib.parse import quote_plus
 
+from dotenv import find_dotenv, load_dotenv
 from pydantic import BaseModel, PostgresDsn, SecretStr, computed_field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+load_dotenv(find_dotenv())
+
+
+def read_password():
+    try:
+        if Path("/run/secrets/pg_password").exists():
+            with open("/run/secrets/pg_password", "r") as f:
+                return f.read().strip()
+        elif Path("./secrets/pg_password.txt").exists():
+            with open("./secrets/pg_password.txt", "r") as f:
+                return f.read().strip()
+    except Exception:
+        raise
+
 
 class DBSettings(BaseModel):
-    user: str = "pingpal"
-    password: str = "pingpal"
-    name: str = "pingpal"
-    host: str = "127.0.0.1"
-    port: int = 5432
+    user: str
+    password: str = os.getenv("DATABASE__PASSWORD") or read_password() or ""
+    name: str
+    host: str
+    port: int
 
-    echo: bool = False
+    echo: bool
 
-    pool_size: int = 0
-    pool_pre_ping: bool = False
+    pool_size: int
+    pool_pre_ping: bool
 
     @computed_field
     @property
     def url(self) -> str:
         encoded_user = quote_plus(self.user)
 
-        password = self.password
-        try:
-            if Path("/run/secrets/pg_password").exists():
-                with open("/run/secrets/pg_password", "r") as f:
-                    password = f.read().strip()
-            elif Path("./secrets/pg_password.txt").exists():
-                with open("./secrets/pg_password.txt", "r") as f:
-                    password = f.read().strip()
-        except Exception:
-            raise
-
-        encoded_password = quote_plus(password)
+        encoded_password = quote_plus(self.password)
 
         return PostgresDsn.build(
             scheme="postgresql+asyncpg",
@@ -48,17 +53,17 @@ class DBSettings(BaseModel):
 
 
 class NATSSettings(BaseModel):
-    url: str = "nats://127.0.0.1:4222"
+    url: str
 
-    kv_bucket: str = "pingpal_config"
-    kv_key_prefix: str = "site."
-    kv_watch_pattern: str = "site.*"
+    kv_bucket: str
+    kv_key_prefix: str
+    kv_watch_pattern: str
 
-    kv_del: str = "DEL"
-    kv_purge: str = "PURGE"
+    kv_del: str
+    kv_purge: str
 
-    metrics_subject: str = "pingpal.metrics.ingest"
-    agents_heartbeat_subject: str = "pingpal.agents.heartbeat"
+    metrics_subject: str
+    agents_heartbeat_subject: str
 
 
 class Settings(BaseSettings):
