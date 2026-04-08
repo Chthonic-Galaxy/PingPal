@@ -44,6 +44,7 @@ services:
       - DATABASE__NAME=pingpal
     secrets:
       - pg_password
+    env_file: .env
     depends_on:
       db:
         condition: service_healthy
@@ -63,6 +64,7 @@ services:
       - DATABASE__NAME=pingpal
     secrets:
       - pg_password
+    env_file: .env
     volumes:
       - ./certs:/app/certs:ro
     depends_on:
@@ -80,6 +82,7 @@ services:
       - TLS_CERT=/app/certs/client-agent.crt
       - TLS_KEY=/app/certs/client-agent.key
       - DATABASE__HOST=db
+    env_file: .env
     volumes:
       - ./certs:/app/certs:ro
     depends_on:
@@ -98,6 +101,7 @@ services:
       - TLS_KEY=/app/certs/client-agent.key
       - DATABASE__HOST=db
       - PINGPAL_REGION=us-east
+    env_file: .env
     volumes:
       - ./certs:/app/certs:ro
     depends_on:
@@ -116,6 +120,7 @@ services:
       - TLS_KEY=/app/certs/client-agent.key
       - DATABASE__HOST=db
       - PINGPAL_REGION=eu-central
+    env_file: .env
     volumes:
       - ./certs:/app/certs:ro
     depends_on:

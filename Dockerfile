@@ -47,7 +47,6 @@ RUN python -m pip install --no-cache-dir --upgrade pip \
 COPY alembic.ini /app/alembic.ini
 COPY migrations /app/migrations
 COPY src /app/src
-COPY .env /app/.env
 
 USER appuser
 
