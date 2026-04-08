@@ -6,9 +6,11 @@ from contextlib import asynccontextmanager
 from typing import Any
 from uuid import UUID
 
+import nats.errors
 from fastapi import Depends, FastAPI
 from nats.aio.client import Client as NATS
 from nats.aio.subscription import Subscription as NATSSubscription
+from nats.js import JetStreamContext
 from nats.js.kv import KeyValue
 from sqlalchemy import insert, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -31,8 +33,6 @@ from src.schemas import AgentHeartbeat, MetricPayload
 setup_logging(settings.log_level)
 logger = logging.getLogger("pingpal-core")
 
-metrics_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=50_000)
-
 
 async def on_heartbeat_msg(msg):
     try:
@@ -40,24 +40,6 @@ async def on_heartbeat_msg(msg):
         active_agents[data.agent_id] = data
     except Exception:
         logger.exception("Bad heartbeat")
-
-
-async def on_metric_msg(msg):
-    try:
-        payload = MetricPayload.model_validate_json(msg.data)
-        row = {
-            "time": payload.timestamp,
-            "site_id": payload.site_id,
-            "region": payload.region,
-            "status_code": payload.status_code,
-            "latency_ms": payload.latency_ms,
-            "error_message": payload.error_message,
-        }
-        metrics_queue.put_nowait(row)
-    except asyncio.QueueFull:
-        logger.warning("metrics_queue is full; dropping metric")
-    except Exception:
-        logger.exception("Failed to parse/queue metric message")
 
 
 async def _sync_kv_from_db(
@@ -107,14 +89,12 @@ async def _sync_kv_from_db(
 
 async def _metrics_db_worker(
     sessionmaker: async_sessionmaker[AsyncSession],
-    queue: asyncio.Queue[dict[str, Any]],
+    psub: JetStreamContext.PullSubscription,
     *,
     batch_size: int = 500,
     flush_interval_s: float = 1.0,
 ) -> None:
-    batch: list[dict[str, Any]] = []
-
-    async def flush(items: list[dict[str, Any]]) -> None:
+    async def _flush(items: list[dict[str, Any]]) -> None:
         if not items:
             return
         async with sessionmaker() as session:
@@ -124,20 +104,37 @@ async def _metrics_db_worker(
             except Exception:
                 await session.rollback()
                 logger.exception("Failed to insert metrics batch (size=%d)", len(items))
+                raise
 
     while True:
         try:
-            item = await asyncio.wait_for(queue.get(), timeout=flush_interval_s)
-            batch.append(item)
-            queue.task_done()
+            msgs = await psub.fetch(batch=batch_size, timeout=flush_interval_s)
+            batch: list[dict[str, Any]] = []
 
-            if len(batch) >= batch_size:
-                await flush(batch)
-                batch.clear()
-        except asyncio.TimeoutError:
-            if batch:
-                await flush(batch)
-                batch.clear()
+            for msg in msgs:
+                try:
+                    payload = MetricPayload.model_validate_json(msg.data)
+                    batch.append(
+                        {
+                            "time": payload.timestamp,
+                            "site_id": payload.site_id,
+                            "region": payload.region,
+                            "status_code": payload.status_code,
+                            "latency_ms": payload.latency_ms,
+                            "error_message": payload.error_message,
+                        }
+                    )
+                except Exception:
+                    logger.exception("Failed to parse/queue metric message")
+
+            try:
+                await _flush(batch)
+            except Exception:
+                continue
+
+            await asyncio.gather(*[msg.ack() for msg in msgs])
+        except nats.errors.TimeoutError:
+            continue
 
 
 @asynccontextmanager
@@ -158,21 +155,27 @@ async def lifespan(app: FastAPI):
         max_reconnect_attempts=-1,
     )
 
+    js = await nats_mgr.get_jetstream()
+    await js.add_stream(name="METRICS", subjects=[settings.nats.metrics_subject])
+
     nats_kv = await nats_mgr.get_kv()
     app.state.kv = nats_kv
 
     await _sync_kv_from_db(db_sessionmaker, nats_kv)
 
     # Metrics ingestion
-    subscriptions: dict[str, NATSSubscription] = {}
-    subscriptions["metrics"] = await nc.subscribe(
-        settings.nats.metrics_subject, cb=on_metric_msg
+    subscriptions: dict[str, NATSSubscription | JetStreamContext.PullSubscription] = {}
+    # subscriptions["metrics"] = await nc.subscribe(
+    #     settings.nats.metrics_subject, cb=on_metric_msg
+    # )
+    subscriptions["metrics"] = await js.pull_subscribe(
+        settings.nats.metrics_subject, durable="metrics_db_writer"
     )
     subscriptions["agent_heartbeat"] = await nc.subscribe(
         settings.nats.agents_heartbeat_subject, cb=on_heartbeat_msg
     )
     worker_task = asyncio.create_task(
-        _metrics_db_worker(db_sessionmaker, metrics_queue)
+        _metrics_db_worker(db_sessionmaker, subscriptions["metrics"])
     )
 
     try:

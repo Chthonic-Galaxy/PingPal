@@ -3,6 +3,7 @@ from ssl import SSLContext
 
 import nats.js.errors as js_errors
 from nats.aio.client import Client as NATSClient
+from nats.js import JetStreamContext
 from nats.js.api import KeyValueConfig, StorageType
 from nats.js.kv import KeyValue
 
@@ -20,6 +21,9 @@ class NATSManager:
         self.settings = settings
 
         logger.debug("NATSManager has been initialyzed")
+
+    async def get_jetstream(self) -> JetStreamContext:
+        return self.nc.jetstream()
 
     async def get_kv(self) -> KeyValue:
         """Create (if needed) and return KV bucket."""

@@ -12,6 +12,7 @@ from uuid import UUID
 import httpx
 import nats.errors
 from nats.aio.client import Client as NATS
+from nats.js import JetStreamContext
 
 from src.config import settings
 from src.infrastructure.logger import setup_logging
@@ -65,7 +66,7 @@ async def ping_loop(
     site_id: UUID,
     url: str,
     interval: int,
-    nc: NATS,
+    js: JetStreamContext,
     client: httpx.AsyncClient,
     stop: asyncio.Event,
     rt_state: RunningTask,
@@ -100,7 +101,7 @@ async def ping_loop(
             )
 
             try:
-                await nc.publish(
+                await js.publish(
                     settings.nats.metrics_subject,
                     metric.model_dump_json().encode("utf-8"),
                 )
@@ -129,6 +130,7 @@ async def main() -> None:
         max_reconnect_attempts=-1,
     )
 
+    js = await nats_mgr.get_jetstream()
     nats_kv = await nats_mgr.get_kv()
 
     tasks: dict[UUID, RunningTask] = {}
@@ -205,7 +207,7 @@ async def main() -> None:
                     site_id=cfg.site_id,
                     url=str(cfg.url),
                     interval=int(cfg.interval),
-                    nc=nc,
+                    js=js,
                     client=client,
                     stop=stop_evt,
                     rt_state=rt,  # forward running task there
