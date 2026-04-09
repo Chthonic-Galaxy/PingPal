@@ -104,7 +104,7 @@ The composite primary key `(time, site_id, region)` means each time-slot is uniq
 - Python 3.13 with `cryptography` installed (only for the cert generation step)
 
 ```bash
-uv init
+uv sync
 ```
 or
 ```bash
